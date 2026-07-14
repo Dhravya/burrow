@@ -16,10 +16,12 @@ import "@wterm/dom/css";
 import "./terminal.css";
 import { Bash, defineCommand } from "just-bash/browser";
 import type { CustomCommand, ExecResult, IFileSystem } from "just-bash/browser";
-import { provide, registerShellCommand, sealShellCommands, use } from "../contract/registry.ts";
+import { provide, registerShellCommand, sealShellCommands, tryUse, use } from "../contract/registry.ts";
 import { WORKSPACE_ROOT } from "../contract/types.ts";
 import type { CommandContext, ShellAPI } from "../contract/types.ts";
 import { editorOpenCommand } from "./commands.ts";
+import { CommandMemory, createCommandMemoryStorage } from "./command-memory.ts";
+import { createHybridSuggestionProvider, ProjectCompletionContextProvider } from "./completion.ts";
 import { BASE_ENV, ShellDriver } from "./driver.ts";
 
 const GREETING: readonly string[] = [
@@ -43,6 +45,15 @@ export async function initShell(termEl: HTMLElement): Promise<void> {
 
   const vfs = use("vfs");
   const events = use("events");
+  const commandMemory = new CommandMemory(createCommandMemoryStorage());
+  await commandMemory.load();
+  commandMemory.attachLifecycle();
+  const completionContext = new ProjectCompletionContextProvider(vfs, events, tryUse("git"));
+  const suggestionProvider = createHybridSuggestionProvider({
+    memory: commandMemory,
+    context: completionContext,
+    ai: tryUse("ai"),
+  });
 
   // 3. One Bash for the lifetime of the app. Shell state (cwd/env) does NOT
   //    persist across exec() calls — the driver threads it manually.
@@ -74,6 +85,23 @@ export async function initShell(termEl: HTMLElement): Promise<void> {
     events,
     write: (data) => term.write(data),
     greeting: GREETING,
+    initialHistory: commandMemory.history(),
+    suggestionProvider,
+    onCommand: async (event) => {
+      const context = await completionContext.get(event.cwd);
+      commandMemory.record({
+        projectKey: context.projectKey,
+        projectRoot: context.projectRoot,
+        cwd: event.cwd,
+        command: event.command,
+        exitCode: event.exitCode,
+        source: event.source,
+      });
+    },
+    onSuggestionAccepted: async (event) => {
+      const context = await completionContext.get(event.cwd);
+      commandMemory.markAccepted(context, event.command);
+    },
   });
 
   await term.init();

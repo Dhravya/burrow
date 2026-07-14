@@ -456,7 +456,10 @@ export interface AiPanelAPI {
   generate(
     messages: ChatMessage[],
     onDelta: (delta: string) => void,
-    options?: { maxNewTokens?: number },
+    options?: {
+      maxNewTokens?: number;
+      priority?: "interactive" | "background";
+    },
   ): AiGenerationHandle;
 }
 
