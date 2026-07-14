@@ -34,6 +34,7 @@ import { initStatusBar } from "./statusbar.ts";
 import { initTransport } from "./transport.ts";
 import { initPreview } from "./preview.ts";
 import { initResizers } from "./layout.ts";
+import { initMobileNav } from "./mobile.ts";
 
 const degraded: string[] = [];
 
@@ -117,6 +118,7 @@ async function boot(): Promise<void> {
   });
 
   initResizers(must("app"));
+  initMobileNav(must("app"), must("mobile-nav"));
 
   // Land on the rendered README (tab state isn't persisted, so every load
   // starts empty — the README is the front door). Skipped if something is

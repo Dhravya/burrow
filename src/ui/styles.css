@@ -132,6 +132,7 @@ a {
 #app {
   display: grid;
   height: 100vh;
+  height: 100dvh; /* mobile browsers: track the real viewport as chrome hides */
   grid-template-columns: var(--sidebar-w) var(--rz) minmax(0, 1fr) var(--rz) var(--rightbar-w);
   grid-template-rows: var(--topbar-h) minmax(0, 1fr) var(--rz) var(--bottom-h) var(--status-h);
   grid-template-areas:
@@ -169,6 +170,10 @@ a {
 }
 #statusbar {
   grid-area: status;
+}
+#mobile-nav {
+  grid-area: mnav;
+  display: none;
 }
 
 /* ── resizers ─────────────────────────────────────────────────────────────── */
@@ -1443,12 +1448,124 @@ a {
     display: none;
   }
 }
-@media (max-width: 720px) {
+
+/* ── mobile: one pane at a time ───────────────────────────────────────────────
+   Below the breakpoint the four workspace panes stack in a single grid cell
+   and #mobile-nav (wired by src/ui/mobile.ts via data-mview on #app) picks
+   which one shows. Inactive panes stay LAID OUT but invisible — the same
+   visibility trick as .panel[hidden] — so the terminal and CodeMirror never
+   reflow to 0×0 while parked. Keep the 768px breakpoint in sync with the
+   matchMedia in src/ui/mobile.ts. */
+@media (max-width: 768px) {
   #app {
-    grid-template-columns: 0 0 minmax(0, 1fr) var(--rz) var(--rightbar-w);
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: var(--topbar-h) minmax(0, 1fr) var(--status-h) auto;
+    grid-template-areas:
+      "top"
+      "main"
+      "status"
+      "mnav";
   }
   #sidebar,
-  #rz-left {
+  #editor-pane,
+  #rightbar,
+  #bottombar {
+    grid-area: main;
+    border: none;
+  }
+  #app:not([data-mview="files"]) #sidebar,
+  #app:not([data-mview="editor"]) #editor-pane,
+  #app:not([data-mview="right"]) #rightbar,
+  #app:not([data-mview="bottom"]) #bottombar {
+    visibility: hidden;
+  }
+  .rz {
     display: none;
+  }
+  #topbar,
+  #statusbar {
+    padding-left: max(12px, env(safe-area-inset-left));
+    padding-right: max(12px, env(safe-area-inset-right));
+  }
+  #boot-banner {
+    bottom: calc(var(--status-h) + 58px + env(safe-area-inset-bottom));
+  }
+  .md-preview {
+    padding: 20px 16px 40px;
+  }
+
+  #mobile-nav {
+    display: flex;
+    align-items: stretch;
+    background: var(--bg2);
+    border-top: 1px solid var(--line2);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .mnav-btn {
+    position: relative;
+    flex: 1;
+    height: 46px;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--fg2);
+    border-right: 1px solid var(--line);
+    transition:
+      color 0.12s ease,
+      background 0.12s ease;
+  }
+  .mnav-btn:last-child {
+    border-right: none;
+  }
+  .mnav-btn.active {
+    color: var(--acc-hi);
+    background: var(--acc-dim);
+  }
+  .mnav-btn.active::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: -1px;
+    height: 2px;
+    background: var(--acc);
+  }
+}
+
+/* ── touch: fatter targets, no hover-gated affordances ────────────────────── */
+@media (pointer: coarse) {
+  :root {
+    --tabbar-h: 40px;
+  }
+  .row {
+    height: 34px;
+  }
+  .row .acts {
+    opacity: 1; /* hover never happens — keep the ⋯ menu reachable */
+    width: 26px;
+    height: 26px;
+  }
+  .row .chev {
+    width: 16px;
+  }
+  .t-btn {
+    height: 32px;
+  }
+  .ftab .x {
+    width: 24px;
+    height: 24px;
+  }
+  .tree-btn {
+    height: 26px;
+    min-width: 26px;
+  }
+  .ghost {
+    height: 30px;
+  }
+  .mini {
+    height: 26px;
+  }
+  .ctxmenu-item {
+    height: 36px;
   }
 }

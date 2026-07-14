@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
     <meta name="color-scheme" content="dark" />
     <title>Burrow — a dev machine in one tab</title>
     <link
@@ -15,7 +15,7 @@
   <body>
     <noscript>Burrow needs JavaScript — everything here runs in your tab.</noscript>
 
-    <div id="app">
+    <div id="app" data-mview="editor">
       <!-- ── top: brand + run transport ─────────────────────────────── -->
       <header id="topbar">
         <div class="brand">
@@ -125,6 +125,14 @@
         <span class="sb-item" id="sb-run">idle</span>
         <a class="sb-item sb-link" id="sb-preview" href="/preview/" target="_blank" rel="noopener" hidden>preview ↗</a>
       </footer>
+
+      <!-- ── phone-width pane switcher (hidden on desktop) ──────────── -->
+      <nav id="mobile-nav" aria-label="panes">
+        <button class="mnav-btn" data-view="files">files</button>
+        <button class="mnav-btn" data-view="editor">code</button>
+        <button class="mnav-btn" data-view="right">ai</button>
+        <button class="mnav-btn" data-view="bottom">term</button>
+      </nav>
     </div>
 
     <div id="boot-banner" hidden></div>
