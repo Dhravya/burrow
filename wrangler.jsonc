@@ -1,0 +1,16 @@
+// Burrow on Cloudflare Workers: static assets from ./dist plus the worker.ts
+// edge handler (git CORS proxy + preview fallback). See worker.ts for routes.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "burrow",
+  "account_id": "47c2b4d598af9d423c06fc9f936226d5",
+  "main": "worker.ts",
+  "compatibility_date": "2026-07-01",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

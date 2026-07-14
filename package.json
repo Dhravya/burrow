@@ -1,0 +1,30 @@
+{
+  "name": "burrow",
+  "description": "A full Bun dev environment running entirely in the browser — bun.wasm, shell, git, and local AI in one tab.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun --hot ./server.ts",
+    "start": "bun ./server.ts",
+    "build": "bun run build.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/semver": "^7.7.1"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@codemirror/lang-javascript": "^6.2.5",
+    "@codemirror/merge": "^6.12.2",
+    "@huggingface/transformers": "^4.2.0",
+    "@wterm/dom": "0.3.0",
+    "buffer": "^6.0.3",
+    "codemirror": "^6.0.2",
+    "isomorphic-git": "^1.38.7",
+    "just-bash": "^3.1.0",
+    "semver": "^7.8.5"
+  }
+}

@@ -1,0 +1,23 @@
+# Burrow — deploy to Cloudflare Workers on every push to main.
+# Builds the static site (bun run build.ts → ./dist) and deploys it together
+# with worker.ts (git CORS proxy + asset serving) via wrangler.
+# Requires the CLOUDFLARE_API_TOKEN repo secret (Workers Scripts: Edit).
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run build.ts
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}

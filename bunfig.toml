@@ -1,0 +1,5 @@
+# burrow — src/ui owns this file (CONTRACT.md §9).
+# just-bash's browser bundle statically imports node:zlib, which breaks
+# HTML-import bundling; the plugin resolves it to a throwing shim.
+[serve.static]
+plugins = ["./src/ui/build-plugins.ts"]

@@ -1,0 +1,35 @@
+/*
+ * Burrow — src/shell/terminal.css
+ * Theme bridge for @wterm/dom. WTerm reads --term-* off the .wterm element;
+ * background / foreground / cursor / selection come from :root in src/ui/
+ * styles.css (transparent bg over the panel, --acc cursor). Here we only
+ * supply what styles.css doesn't: the ANSI 16-color palette + font metrics.
+ * Geometry (size, padding, overflow) is owned by styles.css #terminal — do
+ * NOT set it here, or the two fight and WTerm mis-measures / can't scroll.
+ */
+
+.wterm {
+  --term-font-family: var(--mono, ui-monospace, "SF Mono", Menlo, Consolas, monospace);
+  --term-font-size: 13px;
+  --term-line-height: 1.45;
+  --term-row-height: 18px;
+
+  /* ANSI 0–7 — warm-leaning to sit with Burrow's graphite/amber palette */
+  --term-color-0: #2b2620;
+  --term-color-1: #e5716a;
+  --term-color-2: #b3c186;
+  --term-color-3: #f2a34c;
+  --term-color-4: #82b8d8;
+  --term-color-5: #c79bd8;
+  --term-color-6: #7ec9c4;
+  --term-color-7: #ece3d2;
+  /* bright 8–15 */
+  --term-color-8: #564f43;
+  --term-color-9: #ff8a83;
+  --term-color-10: #c7d69a;
+  --term-color-11: #ffc27a;
+  --term-color-12: #9fcdea;
+  --term-color-13: #dbb4ea;
+  --term-color-14: #94ddd8;
+  --term-color-15: #fbf5e9;
+}
