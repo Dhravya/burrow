@@ -21,3 +21,5 @@ jobs:
       - uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # the action's default wrangler predates wrangler.jsonc support
+          wranglerVersion: "4.110.0"
