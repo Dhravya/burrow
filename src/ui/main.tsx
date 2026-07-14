@@ -14,7 +14,9 @@
  * Boot is resilient: the VFS spine is fatal if it fails, but a module that is
  * missing or half-built only degrades its own feature — the rest still mounts.
  */
-import { initVfs } from "../vfs/index.ts";
+import { initVfs, vfsReady } from "../vfs/index.ts";
+import { tryUse } from "../contract/registry.ts";
+import { WORKSPACE_ROOT } from "../contract/types.ts";
 import { initGit } from "../git/index.ts";
 import { initToolchain } from "../toolchain/index.ts";
 import { initNpm } from "../npm/index.ts";
@@ -22,7 +24,7 @@ import { initAi } from "../ai/index.ts";
 import { initShell } from "../shell/index.ts";
 
 import { must } from "./util.ts";
-import { initEditor } from "./editor.ts";
+import { getActivePath, initEditor } from "./editor.ts";
 import { initFileTree } from "./filetree.ts";
 import { initDiffPanel } from "./diff.ts";
 import { initTabs } from "./tabs.ts";
@@ -115,6 +117,17 @@ async function boot(): Promise<void> {
   });
 
   initResizers(must("app"));
+
+  // Land on the rendered README (tab state isn't persisted, so every load
+  // starts empty — the README is the front door). Skipped if something is
+  // already open, e.g. a fast `edit <file>` racing restore-or-seed.
+  void vfsReady().then(async () => {
+    const vfs = tryUse("vfs");
+    const events = tryUse("events");
+    const readme = `${WORKSPACE_ROOT}/README.md`;
+    if (!vfs || !events || getActivePath() !== null) return;
+    if (await vfs.exists(readme)) events.emit("editor:open", { path: readme });
+  });
 
   if (degraded.length > 0) {
     showBanner(`offline: ${degraded.join(", ")} — the rest of Burrow still works`, "warn");

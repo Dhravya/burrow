@@ -5,6 +5,11 @@
  * always saved (a transient saving…/saved indicator lives in the status bar).
  * Every save goes through vfs.writeFile, so WatchedFs emits "file:changed"
  * and the rest of the app (tree, git panel, hot reload) sees it instantly.
+ *
+ * MARKDOWN PREVIEW: .md files open rendered (src/ui/markdown.ts) with an
+ * edit ⇄ preview chip in the top-right of the pane; the choice sticks per
+ * tab. Workspace-relative image paths resolve through the VFS into blob URLs
+ * (revoked on every rerender); http(s)/data: URLs pass through untouched.
  */
 import { basicSetup } from "codemirror";
 import { EditorView, keymap } from "@codemirror/view";
@@ -13,6 +18,7 @@ import { indentWithTab } from "@codemirror/commands";
 import { javascript } from "@codemirror/lang-javascript";
 import { use } from "../contract/registry.ts";
 import { AutosaveScheduler } from "./autosave.ts";
+import { renderMarkdownDoc } from "./markdown.ts";
 import { burrowTheme } from "./theme.ts";
 import { basename, debounce, decodeText, extOf, h, looksBinary } from "./util.ts";
 
@@ -34,7 +40,11 @@ interface OpenDoc {
   savedText: string;
   binary: boolean;
   byteSize: number;
+  /** .md files only: rendered preview vs raw source. Sticky per tab. */
+  mdPreview?: boolean;
 }
+
+const isMarkdown = (path: string): boolean => extOf(path) === "md";
 
 const docs = new Map<string, OpenDoc>();
 const order: string[] = [];
@@ -49,6 +59,12 @@ let view: EditorView | null = null;
 let tabsEl: HTMLElement | null = null;
 let hostEl: HTMLElement | null = null;
 let emptyEl: HTMLElement | null = null;
+let previewEl: HTMLElement | null = null;
+let mdToggleEl: HTMLButtonElement | null = null;
+/** Blob URLs minted for the current preview render — revoked on the next. */
+let previewBlobUrls: string[] = [];
+/** Guards against a stale async image-hydration pass writing into a newer render. */
+let previewEpoch = 0;
 
 // ── public surface ───────────────────────────────────────────────────────────
 
@@ -79,6 +95,21 @@ export function initEditor(tabs: HTMLElement, host: HTMLElement, empty: HTMLElem
   hostEl = host;
   emptyEl = empty;
   const events = use("events");
+
+  // Preview surface + mode chip live beside the CM host in #editor-body.
+  previewEl = h("div", "md-preview");
+  previewEl.style.display = "none";
+  mdToggleEl = h("button", "md-toggle") as HTMLButtonElement;
+  mdToggleEl.type = "button";
+  mdToggleEl.style.display = "none";
+  mdToggleEl.addEventListener("click", () => {
+    const doc = active ? docs.get(active) : undefined;
+    if (!doc || !isMarkdown(doc.path)) return;
+    doc.mdPreview = !doc.mdPreview;
+    render();
+    if (!doc.mdPreview) view?.focus();
+  });
+  host.parentElement?.append(previewEl, mdToggleEl);
 
   events.on("editor:open", (e) => {
     void open(e.path, e.line, e.column);
@@ -258,9 +289,13 @@ async function open(path: string, line?: number, column?: number): Promise<void>
       savedText: text,
       binary,
       byteSize: buf.byteLength,
+      // Docs read best rendered; jumping to a line means the caller wants source.
+      ...(isMarkdown(path) ? { mdPreview: line === undefined } : {}),
     });
     order.push(path);
   }
+  const doc = docs.get(path);
+  if (line !== undefined && doc?.mdPreview) doc.mdPreview = false; // reveal needs source
   activate(path);
   if (line !== undefined) reveal(line, column);
 }
@@ -275,7 +310,7 @@ function activate(path: string): void {
     else view.setState(next.state);
   }
   render();
-  if (!next.binary) view?.focus();
+  if (!next.binary && !next.mdPreview) view?.focus();
 }
 
 /** Keep undo history + selection when switching tabs. */
@@ -365,6 +400,8 @@ async function reload(path: string): Promise<void> {
     } else {
       doc.state = makeState(path, text);
     }
+    // A previewed doc follows the disk immediately (agent edits, git checkout).
+    if (active === path && doc.mdPreview) renderPreview(doc);
   }
   // With edits pending, the buffer wins: the scheduled autosave will
   // overwrite the disk in <400ms anyway.
@@ -375,10 +412,19 @@ async function reload(path: string): Promise<void> {
 function render(): void {
   renderTabs();
   const doc = active ? docs.get(active) : undefined;
-  if (hostEl && emptyEl) {
-    const showEditor = !!doc && !doc.binary;
+  if (hostEl && emptyEl && previewEl && mdToggleEl) {
+    const showPreview = !!doc && !doc.binary && !!doc.mdPreview;
+    const showEditor = !!doc && !doc.binary && !showPreview;
     hostEl.style.display = showEditor ? "" : "none";
-    emptyEl.style.display = showEditor ? "none" : "";
+    previewEl.style.display = showPreview ? "" : "none";
+    emptyEl.style.display = showEditor || showPreview ? "none" : "";
+    const isMd = !!doc && !doc.binary && isMarkdown(doc.path);
+    mdToggleEl.style.display = isMd ? "" : "none";
+    if (isMd) {
+      mdToggleEl.textContent = showPreview ? "✎ edit" : "◫ preview";
+      mdToggleEl.title = showPreview ? "edit the source" : "render the markdown";
+    }
+    if (showPreview && doc) renderPreview(doc);
     if (!doc) {
       emptyEl.textContent = "Nothing open yet. Pick a file from the tree, or type `edit index.ts` in the terminal.";
     } else if (doc.binary) {
@@ -386,6 +432,59 @@ function render(): void {
     }
   }
   notify();
+}
+
+// ── markdown preview ─────────────────────────────────────────────────────────
+
+const IMAGE_MIME: Record<string, string> = {
+  svg: "image/svg+xml", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  gif: "image/gif", webp: "image/webp", ico: "image/x-icon", bmp: "image/bmp",
+};
+
+/** Resolve a markdown-relative src against the doc's directory ("."/".." aware). */
+function resolveDocPath(docPath: string, src: string): string {
+  const base = src.startsWith("/") ? [] : docPath.split("/").slice(0, -1);
+  const segments = [...base, ...src.split("/")];
+  const out: string[] = [];
+  for (const seg of segments) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") out.pop();
+    else out.push(seg);
+  }
+  return `/${out.join("/")}`;
+}
+
+function renderPreview(doc: OpenDoc): void {
+  if (!previewEl) return;
+  const epoch = ++previewEpoch;
+  for (const url of previewBlobUrls) URL.revokeObjectURL(url);
+  previewBlobUrls = [];
+  previewEl.innerHTML = renderMarkdownDoc(textOf(doc));
+  previewEl.scrollTop = 0;
+
+  // Hydrate images: http(s)/data: pass through; anything else is a workspace
+  // path served out of the VFS as a blob URL (async — epoch-guarded).
+  for (const img of previewEl.querySelectorAll<HTMLImageElement>("img[data-md-src]")) {
+    const src = img.getAttribute("data-md-src") ?? "";
+    if (/^(https?:|data:)/i.test(src)) {
+      img.src = src;
+      continue;
+    }
+    const path = resolveDocPath(doc.path, src);
+    void use("vfs")
+      .readFileBuffer(path)
+      .then((buf) => {
+        if (epoch !== previewEpoch) return;
+        const mime = IMAGE_MIME[extOf(path)] ?? "application/octet-stream";
+        const url = URL.createObjectURL(new Blob([buf as BlobPart], { type: mime }));
+        previewBlobUrls.push(url);
+        img.src = url;
+      })
+      .catch(() => {
+        img.alt = `${img.alt || src} (missing: ${path})`;
+        img.classList.add("md-img-missing");
+      });
+  }
 }
 
 function renderTabs(): void {
