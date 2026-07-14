@@ -1,12 +1,15 @@
-import { describe, expect, test } from "bun:test";
-import { tryUse } from "../contract/registry.ts";
+import { beforeAll, describe, expect, test } from "bun:test";
+import { resetRegistryForTests, tryUse } from "../contract/registry.ts";
 import { WORKSPACE_ROOT } from "../contract/types.ts";
 import { initVfs, resetWorkspace, vfsReady } from "./index.ts";
 import { DEMO_DIR } from "./seed.ts";
 
 // NOTE: the registry is module-global and provide() throws on duplicates, so
 // initVfs() runs exactly once for this whole test process — keep every
-// registry-touching assertion in this file.
+// registry-touching assertion in this file. Test-file ORDER is platform
+// dependent (CI runs shell/driver.test.ts, which lazily provides "events",
+// before this file), so wipe whatever earlier files left behind first.
+beforeAll(() => resetRegistryForTests());
 
 describe("initVfs", () => {
   test("provides events, vfs, and gitFs; seeds README + demo project", async () => {

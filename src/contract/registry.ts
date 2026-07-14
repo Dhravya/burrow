@@ -31,6 +31,19 @@ export function tryUse<K extends keyof Services>(name: K): Services[K] | undefin
   return services.get(name) as Services[K] | undefined;
 }
 
+/**
+ * TEST-ONLY: wipe services + unseal shell commands. `bun test` runs every file
+ * in one process, and file order differs across platforms — a registry-booting
+ * test file (src/vfs/index.test.ts) calls this first so a lazily-providing file
+ * that happened to run earlier (src/shell/driver.test.ts) can't trip the
+ * double-provide guard. Never call outside tests.
+ */
+export function resetRegistryForTests(): void {
+  services.clear();
+  shellCommands.length = 0;
+  shellCommandsSealed = false;
+}
+
 // ---------------------------------------------------------------------------
 // Shell command collection. Modules register during their init; the shell
 // module (which boots after all command providers) drains this list into
