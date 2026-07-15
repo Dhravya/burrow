@@ -18,6 +18,21 @@
 import type { Bash } from "just-bash/browser";
 import type { EventBus, ShellExecResult } from "../contract/types.ts";
 import { WORKSPACE_ROOT } from "../contract/types.ts";
+import type { CommandSource } from "./command-memory.ts";
+import type { ShellSuggestionProvider, SuggestionOrigin } from "./completion.ts";
+
+export interface ShellCommandEvent {
+  command: string;
+  cwd: string;
+  exitCode: number;
+  source: CommandSource;
+}
+
+export interface ShellSuggestionAcceptedEvent {
+  command: string;
+  cwd: string;
+  origin: SuggestionOrigin;
+}
 
 export const BASE_ENV: Record<string, string> = {
   SHELL: "/bin/bash",
@@ -34,6 +49,11 @@ export interface ShellDriverOptions {
   write: (data: string) => void;
   /** Lines printed once by start(), before the first prompt. */
   greeting?: readonly string[];
+  initialHistory?: readonly string[];
+  suggestionProvider?: ShellSuggestionProvider;
+  suggestionDebounceMs?: number;
+  onCommand?: (event: ShellCommandEvent) => void | Promise<void>;
+  onSuggestionAccepted?: (event: ShellSuggestionAcceptedEvent) => void | Promise<void>;
 }
 
 const RED = "\x1b[31m";
@@ -53,6 +73,10 @@ export class ShellDriver {
   private readonly events: EventBus;
   private readonly write: (data: string) => void;
   private readonly greeting: readonly string[];
+  private readonly suggestionProvider: ShellSuggestionProvider | undefined;
+  private readonly suggestionDebounceMs: number;
+  private readonly onCommand: ShellDriverOptions["onCommand"];
+  private readonly onSuggestionAccepted: ShellDriverOptions["onSuggestionAccepted"];
 
   // ---- line editor state ----
   private line = "";
@@ -60,6 +84,11 @@ export class ShellDriver {
   private continuation = ""; // backslash-continued previous lines
   private history: string[] = [];
   private historyPos = -1;
+  private acceptedSuggestion: string | null = null;
+  private suggestion: { command: string; origin: SuggestionOrigin } | null = null;
+  private suggestionTimer: ReturnType<typeof setTimeout> | null = null;
+  private suggestionAbort: AbortController | null = null;
+  private suggestionEpoch = 0;
 
   // ---- execution state ----
   private cwd = WORKSPACE_ROOT;
@@ -76,6 +105,11 @@ export class ShellDriver {
     this.events = options.events;
     this.write = options.write;
     this.greeting = options.greeting ?? [];
+    this.history = [...(options.initialHistory ?? [])];
+    this.suggestionProvider = options.suggestionProvider;
+    this.suggestionDebounceMs = options.suggestionDebounceMs ?? 90;
+    this.onCommand = options.onCommand;
+    this.onSuggestionAccepted = options.onSuggestionAccepted;
   }
 
   /** Print greeting + first prompt. Call once after the terminal is ready. */
@@ -105,6 +139,7 @@ export class ShellDriver {
 
   exec(line: string, options?: { echo?: boolean; signal?: AbortSignal }): Promise<ShellExecResult> {
     return this.enqueue(async () => {
+      this.clearSuggestion();
       const echo = options?.echo ?? false;
       if (echo) {
         // Clear any partially-typed interactive line, render like a typed command.
@@ -115,16 +150,22 @@ export class ShellDriver {
         this.historyPos = -1;
       }
       try {
-        const result = await this.runCommand(line, options?.signal);
+        const result = await this.runCommand(line, options?.signal, "programmatic");
         if (echo) {
           this.printResult(result);
           this.restoreLine();
+          this.scheduleSuggestion();
+        } else {
+          this.scheduleSuggestion();
         }
         return result;
       } catch (err) {
         if (echo) {
           this.write(`${RED}${toCrlf(errorMessage(err))}${RESET}\r\n`);
           this.restoreLine();
+          this.scheduleSuggestion();
+        } else {
+          this.scheduleSuggestion();
         }
         throw err;
       }
@@ -172,53 +213,77 @@ export class ShellDriver {
 
     switch (data) {
       case "\t":
+        this.clearSuggestion();
+        this.acceptedSuggestion = null;
         await this.tabComplete();
+        this.scheduleSuggestion();
         return;
       case "\r":
         await this.acceptLine();
         return;
       case "\x7f":
       case "\b":
+        this.clearSuggestion();
+        this.acceptedSuggestion = null;
         this.backspace();
+        this.scheduleSuggestion();
         return;
-      case "\x1b[3~": // Delete
+      case "\x1b[3~":
+        this.clearSuggestion();
+        this.acceptedSuggestion = null;
         this.deleteForward();
+        this.scheduleSuggestion();
         return;
-      case "\x1b[A": // Up
+      case "\x1b[A":
+        this.clearSuggestion();
+        this.acceptedSuggestion = null;
         this.historyPrev();
+        this.scheduleSuggestion();
         return;
-      case "\x1b[B": // Down
+      case "\x1b[B":
+        this.clearSuggestion();
+        this.acceptedSuggestion = null;
         this.historyNext();
+        this.scheduleSuggestion();
         return;
-      case "\x1b[D": // Left
+      case "\x1b[D":
+        this.clearSuggestion();
         if (this.cursor > 0) {
           this.cursor--;
           this.write("\x1b[D");
         }
         return;
-      case "\x1b[C": // Right
+      case "\x1b[C":
         if (this.cursor < this.line.length) {
+          this.clearSuggestion();
           this.cursor++;
           this.write("\x1b[C");
+        } else if (this.suggestion !== null) {
+          this.acceptSuggestion();
         }
         return;
-      case "\x01": // Ctrl+A — start of line
+      case "\x01":
       case "\x1b[H":
       case "\x1b[1~":
+        this.clearSuggestion();
         if (this.cursor > 0) {
           this.write(`\x1b[${this.cursor}D`);
           this.cursor = 0;
         }
         return;
-      case "\x05": // Ctrl+E — end of line
+      case "\x05":
       case "\x1b[F":
       case "\x1b[4~":
+        this.clearSuggestion();
         if (this.cursor < this.line.length) {
           this.write(`\x1b[${this.line.length - this.cursor}C`);
           this.cursor = this.line.length;
         }
+        this.scheduleSuggestion();
         return;
-      case "\x15": // Ctrl+U — kill line
+      case "\x15":
+        this.clearSuggestion();
+        this.acceptedSuggestion = null;
         if (this.line.length > 0) {
           if (this.cursor > 0) this.write(`\x1b[${this.cursor}D`);
           this.write("\x1b[K");
@@ -226,10 +291,15 @@ export class ShellDriver {
           this.cursor = 0;
         }
         return;
-      case "\x17": // Ctrl+W — kill word backwards
+      case "\x17":
+        this.clearSuggestion();
+        this.acceptedSuggestion = null;
         this.killWordBack();
+        this.scheduleSuggestion();
         return;
-      case "\x03": // Ctrl+C — abandon current line
+      case "\x03":
+        this.clearSuggestion();
+        this.acceptedSuggestion = null;
         this.line = "";
         this.cursor = 0;
         this.continuation = "";
@@ -237,18 +307,20 @@ export class ShellDriver {
         this.write("^C\r\n");
         this.write(this.prompt());
         return;
-      case "\x0c": // Ctrl+L — clear screen
+      case "\x0c":
+        this.clearSuggestion();
         this.write("\x1b[2J\x1b[H");
         this.write(this.prompt());
         this.write(this.line);
         if (this.cursor < this.line.length) {
           this.write(`\x1b[${this.line.length - this.cursor}D`);
         }
+        this.scheduleSuggestion();
         return;
     }
 
     if (data.length === 1 && data >= " ") {
-      this.insert(data);
+      this.typePrintable(data);
     } else if (data.length > 1 && !data.startsWith("\x1b")) {
       // Multi-char paste — feed sequentially (a "\r" mid-paste runs the line
       // and the loop resumes with the remaining characters afterwards). Stays
@@ -282,6 +354,109 @@ export class ShellDriver {
       this.write(data + tail + "\x1b[K");
       this.write(`\x1b[${tail.length}D`);
     }
+  }
+
+  private typePrintable(data: string): void {
+    const previous = this.suggestion;
+    this.eraseSuggestion();
+    this.cancelSuggestionRequest();
+    this.acceptedSuggestion = null;
+    this.insert(data);
+    if (previous !== null && previous.command.startsWith(this.line) && previous.command !== this.line) {
+      this.renderSuggestion(previous.command, previous.origin);
+      this.scheduleSuggestion();
+    } else {
+      this.scheduleSuggestion();
+    }
+  }
+
+  private acceptSuggestion(): void {
+    const current = this.suggestion;
+    if (current === null || !current.command.startsWith(this.line)) return;
+    const suffix = current.command.slice(this.line.length);
+    this.eraseSuggestion();
+    this.cancelSuggestionRequest();
+    this.insert(suffix);
+    this.acceptedSuggestion = current.command;
+    void Promise.resolve(
+      this.onSuggestionAccepted?.({ command: current.command, cwd: this.cwd, origin: current.origin }),
+    ).catch(() => {});
+  }
+
+  private renderSuggestion(command: string, origin: SuggestionOrigin): void {
+    if (
+      this.busy ||
+      this.continuation ||
+      this.cursor !== this.line.length ||
+      command === this.line ||
+      !command.startsWith(this.line) ||
+      /[\x00-\x1f\x7f-\x9f]/.test(command)
+    ) {
+      return;
+    }
+    this.eraseSuggestion();
+    this.suggestion = { command, origin };
+    this.write(`\x1b7\x1b[2m${command.slice(this.line.length)}\x1b[22m\x1b8`);
+  }
+
+  private eraseSuggestion(): void {
+    if (this.suggestion === null) return;
+    this.write("\x1b[J");
+    this.suggestion = null;
+  }
+
+  private cancelSuggestionRequest(): void {
+    this.suggestionEpoch++;
+    if (this.suggestionTimer !== null) {
+      clearTimeout(this.suggestionTimer);
+      this.suggestionTimer = null;
+    }
+    this.suggestionAbort?.abort();
+    this.suggestionAbort = null;
+  }
+
+  private clearSuggestion(): void {
+    this.eraseSuggestion();
+    this.cancelSuggestionRequest();
+  }
+
+  private scheduleSuggestion(): void {
+    this.cancelSuggestionRequest();
+    if (
+      !this.suggestionProvider ||
+      this.busy ||
+      this.continuation ||
+      !this.line.trim() ||
+      this.cursor !== this.line.length
+    ) {
+      return;
+    }
+    const epoch = this.suggestionEpoch;
+    const line = this.line;
+    const cwd = this.cwd;
+    this.suggestionTimer = setTimeout(() => {
+      this.suggestionTimer = null;
+      if (epoch !== this.suggestionEpoch || line !== this.line || cwd !== this.cwd) return;
+      const controller = new AbortController();
+      this.suggestionAbort = controller;
+      const emit = (command: string, origin: SuggestionOrigin): void => {
+        if (
+          controller.signal.aborted ||
+          epoch !== this.suggestionEpoch ||
+          line !== this.line ||
+          cwd !== this.cwd ||
+          this.cursor !== this.line.length
+        ) {
+          return;
+        }
+        this.renderSuggestion(command, origin);
+      };
+      void this.suggestionProvider!({ line, cwd, signal: controller.signal }, emit)
+        .catch(() => {})
+        .finally(() => {
+          if (this.suggestionAbort === controller) this.suggestionAbort = null;
+        });
+    }, this.suggestionDebounceMs);
   }
 
   private backspace(): void {
@@ -355,6 +530,9 @@ export class ShellDriver {
 
   private async acceptLine(): Promise<void> {
     const current = this.line;
+    const source: CommandSource = this.acceptedSuggestion === current ? "suggestion" : "interactive";
+    this.clearSuggestion();
+    this.acceptedSuggestion = null;
     this.line = "";
     this.cursor = 0;
     this.write("\r\n");
@@ -379,7 +557,7 @@ export class ShellDriver {
     this.historyPos = -1;
 
     try {
-      const result = await this.enqueue(() => this.runCommand(cmd));
+      const result = await this.enqueue(() => this.runCommand(cmd, undefined, source));
       this.printResult(result);
     } catch (err) {
       this.write(`${RED}${toCrlf(errorMessage(err))}${RESET}\r\n`);
@@ -391,7 +569,12 @@ export class ShellDriver {
    * THE execution core (contract §5): one exec, thread {cwd, env}, read the
    * new state back from result.env. Runs inside the queue.
    */
-  private async runCommand(cmd: string, externalSignal?: AbortSignal): Promise<ShellExecResult> {
+  private async runCommand(
+    cmd: string,
+    externalSignal?: AbortSignal,
+    source: CommandSource = "programmatic",
+  ): Promise<ShellExecResult> {
+    const startedCwd = this.cwd;
     const ac = new AbortController();
     const onExternalAbort = () => ac.abort();
     if (externalSignal) {
@@ -408,6 +591,14 @@ export class ShellDriver {
         this.cwd = nextCwd;
         this.events.emit("cwd:changed", { cwd: nextCwd });
       }
+      void Promise.resolve(
+        this.onCommand?.({
+          command: cmd,
+          cwd: startedCwd,
+          exitCode: result.exitCode,
+          source,
+        }),
+      ).catch(() => {});
       return result;
     } finally {
       this.busy = false;

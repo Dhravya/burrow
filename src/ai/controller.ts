@@ -42,10 +42,16 @@ interface PendingLoad {
 }
 
 interface PendingGen {
+  priority: "interactive" | "background";
+  messages: ChatMessage[];
+  maxNewTokens?: number;
   onDelta: (delta: string) => void;
   resolve: (text: string) => void;
   reject: (error: Error) => void;
   accumulated: string;
+  settled: boolean;
+  cancelled: boolean;
+  preempted: boolean;
 }
 
 export function createAiController(): AiController {
@@ -56,7 +62,8 @@ export function createAiController(): AiController {
   let webgpuOk = false;
 
   let pendingLoad: PendingLoad | null = null;
-  let pendingGen: PendingGen | null = null;
+  let activeGen: PendingGen | null = null;
+  let queuedInteractive: PendingGen | null = null;
 
   const stateHandlers = new Set<(s: AiState) => void>();
 
@@ -93,11 +100,49 @@ export function createAiController(): AiController {
       pendingLoad = null;
       p.reject(error);
     }
-    if (pendingGen) {
-      const g = pendingGen;
-      pendingGen = null;
-      g.reject(error);
+    if (activeGen) rejectGen(activeGen, error);
+    if (queuedInteractive) rejectGen(queuedInteractive, error);
+    activeGen = null;
+    queuedInteractive = null;
+  };
+
+  const resolveGen = (gen: PendingGen, text: string): void => {
+    if (gen.settled) return;
+    gen.settled = true;
+    gen.resolve(text);
+  };
+
+  const rejectGen = (gen: PendingGen, error: Error): void => {
+    if (gen.settled) return;
+    gen.settled = true;
+    gen.reject(error);
+  };
+
+  const startGeneration = (gen: PendingGen): void => {
+    activeGen = gen;
+    if (gen.priority === "interactive") setState("generating");
+    ensureWorker().postMessage({
+      type: "generate",
+      messages: gen.messages,
+      maxNewTokens: gen.maxNewTokens,
+    } satisfies AiWorkerRequest);
+  };
+
+  const finishActive = (result: { text: string } | { error: Error }): void => {
+    const gen = activeGen;
+    if (!gen) return;
+    activeGen = null;
+    if ("error" in result) rejectGen(gen, result.error);
+    else if (gen.preempted) rejectGen(gen, new Error("Background generation was preempted by the agent."));
+    else resolveGen(gen, result.text || gen.accumulated);
+
+    const next = queuedInteractive;
+    queuedInteractive = null;
+    if (next && !next.cancelled) {
+      startGeneration(next);
+      return;
     }
+    if (state === "generating") setState(loaded ? "ready" : "error");
   };
 
   const handleMessage = (msg: AiWorkerResponse): void => {
@@ -115,20 +160,13 @@ export function createAiController(): AiController {
         }
         break;
       case "token":
-        if (pendingGen) {
-          pendingGen.accumulated += msg.delta;
-          pendingGen.onDelta(msg.delta);
+        if (activeGen && !activeGen.preempted && !activeGen.settled) {
+          activeGen.accumulated += msg.delta;
+          activeGen.onDelta(msg.delta);
         }
         break;
       case "done":
-        if (pendingGen) {
-          const g = pendingGen;
-          pendingGen = null;
-          setState("ready");
-          // The worker yields the canonical full text; prefer it over the
-          // delta accumulation (they agree, but "done" is authoritative).
-          g.resolve(msg.text || g.accumulated);
-        }
+        finishActive({ text: msg.text });
         break;
       case "error": {
         const error = new Error(msg.message || "AI worker error");
@@ -137,13 +175,8 @@ export function createAiController(): AiController {
           pendingLoad = null;
           setState("error");
           p.reject(error);
-        } else if (pendingGen) {
-          const g = pendingGen;
-          pendingGen = null;
-          // A generation failure is recoverable — fall back to ready if a
-          // model is loaded, else error.
-          setState(loaded ? "ready" : "error");
-          g.reject(error);
+        } else if (activeGen) {
+          finishActive({ error });
         } else {
           setState("error");
         }
@@ -244,7 +277,7 @@ export function createAiController(): AiController {
     generate(
       messages: ChatMessage[],
       onDelta: (delta: string) => void,
-      options?: { maxNewTokens?: number },
+      options?: { maxNewTokens?: number; priority?: "interactive" | "background" },
     ): AiGenerationHandle {
       let settle!: (text: string) => void;
       let fail!: (error: Error) => void;
@@ -257,21 +290,58 @@ export function createAiController(): AiController {
         fail(new Error("No model is loaded — click Load model first."));
         return { cancel: () => {}, done };
       }
-      if (pendingGen) {
-        fail(new Error("Already generating — stop the current reply first."));
-        return { cancel: () => {}, done };
-      }
+      const gen: PendingGen = {
+        priority: options?.priority ?? "interactive",
+        messages,
+        maxNewTokens: options?.maxNewTokens,
+        onDelta,
+        resolve: settle,
+        reject: fail,
+        accumulated: "",
+        settled: false,
+        cancelled: false,
+        preempted: false,
+      };
 
-      pendingGen = { onDelta, resolve: settle, reject: fail, accumulated: "" };
-      setState("generating");
-      post({ type: "generate", messages, maxNewTokens: options?.maxNewTokens });
-
-      return {
+      const handle: AiGenerationHandle = {
         cancel: () => {
-          if (worker) post({ type: "interrupt" });
+          if (gen.cancelled || gen.settled) return;
+          gen.cancelled = true;
+          if (activeGen === gen) {
+            if (worker) post({ type: "interrupt" });
+          } else if (queuedInteractive === gen) {
+            queuedInteractive = null;
+            resolveGen(gen, "");
+            if (state === "generating") setState(loaded ? "ready" : "error");
+          }
         },
         done,
       };
+
+      if (gen.priority === "background") {
+        if (state !== "ready" || activeGen || queuedInteractive) {
+          fail(new Error("AI is busy — background suggestion skipped."));
+          return handle;
+        }
+        startGeneration(gen);
+        return handle;
+      }
+
+      if (queuedInteractive || activeGen?.priority === "interactive") {
+        fail(new Error("Already generating — stop the current reply first."));
+        return handle;
+      }
+
+      if (activeGen?.priority === "background") {
+        queuedInteractive = gen;
+        setState("generating");
+        activeGen.preempted = true;
+        rejectGen(activeGen, new Error("Background generation was preempted by the agent."));
+        post({ type: "interrupt" });
+      } else {
+        startGeneration(gen);
+      }
+      return handle;
     },
 
     loadedModel(): AiModelId | null {
