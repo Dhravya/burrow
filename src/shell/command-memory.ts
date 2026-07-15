@@ -39,6 +39,15 @@ export interface RankedCommand {
   source: "history" | "transition" | "project" | "general";
 }
 
+export interface CommandRetrieval {
+  folderHistory: RankedCommand[];
+  projectHistory: RankedCommand[];
+  globalHistory: RankedCommand[];
+  transitions: RankedCommand[];
+  contextCandidates: RankedCommand[];
+  ranked: RankedCommand[];
+}
+
 export interface RankRequest extends CommandScope {
   prefix: string;
   projectCandidates?: readonly string[];
@@ -50,6 +59,18 @@ interface PersistedCommandMemory {
   version: 1;
   stats: CommandStat[];
   recent: RecentCommandRun[];
+}
+
+interface AggregatedCommandStat {
+  command: string;
+  uses: number;
+  interactiveUses: number;
+  successes: number;
+  failures: number;
+  accepted: number;
+  lastUsedAt: number;
+  projects: Set<string>;
+  folders: Set<string>;
 }
 
 export interface CommandMemoryStorage {
@@ -167,31 +188,72 @@ function decodePersisted(raw: unknown): PersistedCommandMemory | null {
   return { version: VERSION, stats, recent };
 }
 
-function directoryDistance(from: string, to: string): number {
-  const a = from.split("/").filter(Boolean);
-  const b = to.split("/").filter(Boolean);
-  let common = 0;
-  while (common < a.length && common < b.length && a[common] === b[common]) common++;
-  return a.length + b.length - common * 2;
-}
-
-function scopeScore(stat: Pick<CommandStat, "projectKey" | "cwd">, request: CommandScope): number {
-  if (stat.projectKey !== request.projectKey) return 2;
-  if (stat.cwd === request.cwd) return 80;
-  if (request.cwd.startsWith(`${stat.cwd}/`)) {
-    return Math.max(32, 52 - directoryDistance(stat.cwd, request.cwd) * 4);
-  }
-  if (stat.cwd.startsWith(`${request.cwd}/`)) {
-    return Math.max(12, 24 - directoryDistance(stat.cwd, request.cwd) * 3);
-  }
-  return 12;
-}
-
 function transitionScopeScore(run: RecentCommandRun, request: CommandScope): number {
   if (run.projectKey !== request.projectKey) return 4;
   if (run.cwd === request.cwd) return 54;
   if (request.cwd.startsWith(`${run.cwd}/`)) return 34;
   return 18;
+}
+
+function aggregateStats(stats: readonly CommandStat[]): AggregatedCommandStat[] {
+  const aggregated = new Map<string, AggregatedCommandStat>();
+  for (const stat of stats) {
+    if (stat.successes === 0 || (stat.interactiveUses === 0 && stat.accepted === 0)) continue;
+    const row = aggregated.get(stat.command) ?? {
+      command: stat.command,
+      uses: 0,
+      interactiveUses: 0,
+      successes: 0,
+      failures: 0,
+      accepted: 0,
+      lastUsedAt: 0,
+      projects: new Set<string>(),
+      folders: new Set<string>(),
+    };
+    row.uses += stat.uses;
+    row.interactiveUses += stat.interactiveUses;
+    row.successes += stat.successes;
+    row.failures += stat.failures;
+    row.accepted += stat.accepted;
+    row.lastUsedAt = Math.max(row.lastUsedAt, stat.lastUsedAt);
+    row.projects.add(stat.projectKey);
+    row.folders.add(`${stat.projectKey}\0${stat.cwd}`);
+    aggregated.set(stat.command, row);
+  }
+  return [...aggregated.values()];
+}
+
+function historySignal(stat: AggregatedCommandStat, now: number): number {
+  const interactiveWeight = stat.interactiveUses + (stat.uses - stat.interactiveUses) * 0.25;
+  const ageDays = Math.max(0, now - stat.lastUsedAt) / 86_400_000;
+  const recency = 14 * Math.exp(-ageDays / 21);
+  const successRate = stat.uses === 0 ? 0 : Math.min(1, stat.successes / stat.uses);
+  return (
+    Math.log2(interactiveWeight + 1) * 9 +
+    recency +
+    successRate * 8 +
+    Math.min(16, stat.accepted * 2) -
+    Math.min(16, stat.failures * 2)
+  );
+}
+
+function rankAggregates(
+  stats: readonly AggregatedCommandStat[],
+  prefix: string,
+  now: number,
+  base: number,
+  spread: (stat: AggregatedCommandStat) => number,
+  limit: number,
+): RankedCommand[] {
+  return stats
+    .filter((stat) => stat.command.startsWith(prefix) && stat.command !== prefix)
+    .map((stat) => ({
+      command: stat.command,
+      score: base + historySignal(stat, now) + spread(stat),
+      source: "history" as const,
+    }))
+    .sort((a, b) => b.score - a.score || a.command.length - b.command.length || a.command.localeCompare(b.command))
+    .slice(0, limit);
 }
 
 export class CommandMemory {
@@ -322,39 +384,72 @@ export class CommandMemory {
   }
 
   rank(request: RankRequest): RankedCommand[] {
+    return this.retrieve(request).ranked;
+  }
+
+  retrieve(request: RankRequest): CommandRetrieval {
     const prefix = request.prefix;
-    if (!prefix || /[\x00-\x1f\x7f-\x9f]/.test(prefix)) return [];
-    const ranked = new Map<string, RankedCommand>();
-    const add = (raw: string, score: number, source: RankedCommand["source"]): void => {
+    const empty: CommandRetrieval = {
+      folderHistory: [],
+      projectHistory: [],
+      globalHistory: [],
+      transitions: [],
+      contextCandidates: [],
+      ranked: [],
+    };
+    if (!prefix || /[\x00-\x1f\x7f-\x9f]/.test(prefix)) return empty;
+    const now = this.#now();
+    const allStats = [...this.#stats.values()];
+    const folderHistory = rankAggregates(
+      aggregateStats(allStats.filter((stat) => stat.projectKey === request.projectKey && stat.cwd === request.cwd)),
+      prefix,
+      now,
+      96,
+      () => 0,
+      3,
+    );
+    const projectHistory = rankAggregates(
+      aggregateStats(allStats.filter((stat) => stat.projectKey === request.projectKey)),
+      prefix,
+      now,
+      62,
+      (stat) => Math.min(14, stat.folders.size * 2),
+      3,
+    ).filter((candidate) => !folderHistory.some((folder) => folder.command === candidate.command));
+    const globalHistory = rankAggregates(
+      aggregateStats(allStats),
+      prefix,
+      now,
+      12,
+      (stat) => Math.min(24, stat.projects.size * 4 + stat.folders.size),
+      3,
+    ).filter(
+      (candidate) =>
+        !folderHistory.some((folder) => folder.command === candidate.command) &&
+        !projectHistory.some((project) => project.command === candidate.command),
+    );
+
+    const transitionMap = new Map<string, RankedCommand>();
+    const addTransition = (raw: string, score: number): void => {
       const command = cleanCommand(raw);
       if (command === null || command === prefix || !command.startsWith(prefix)) return;
-      const previous = ranked.get(command);
-      if (!previous || score > previous.score) ranked.set(command, { command, score, source });
+      const previous = transitionMap.get(command);
+      if (!previous || score > previous.score) {
+        transitionMap.set(command, { command, score, source: "transition" });
+      }
     };
-
-    const now = this.#now();
-    for (const stat of this.#stats.values()) {
-      if (!stat.command.startsWith(prefix) || stat.command === prefix) continue;
-      const interactiveWeight = stat.interactiveUses + (stat.uses - stat.interactiveUses) * 0.25;
-      const ageDays = Math.max(0, now - stat.lastUsedAt) / 86_400_000;
-      const recency = 12 * Math.exp(-ageDays / 21);
-      const successRate = stat.uses === 0 ? 0 : stat.successes / stat.uses;
-      const score =
-        scopeScore(stat, request) +
-        Math.log2(interactiveWeight + 1) * 8 +
-        recency +
-        successRate * 5 +
-        Math.min(12, stat.accepted * 2);
-      add(stat.command, score, "history");
-    }
-
     const last = this.#lastUserRun(request);
     if (last !== null) {
       const boosts = new Map<string, number>();
       for (let i = 1; i < this.#recent.length; i++) {
         const previous = this.#recent[i - 1]!;
         const next = this.#recent[i]!;
-        if (previous.source === "programmatic" || next.source === "programmatic" || previous.command !== last.command) {
+        if (
+          previous.source === "programmatic" ||
+          next.source === "programmatic" ||
+          next.exitCode !== 0 ||
+          previous.command !== last.command
+        ) {
           continue;
         }
         const ageDays = Math.max(0, now - next.at) / 86_400_000;
@@ -362,23 +457,42 @@ export class CommandMemory {
         boosts.set(next.command, (boosts.get(next.command) ?? 0) + boost);
       }
       for (const [command, rawBoost] of boosts) {
-        const boost = Math.min(48, rawBoost);
-        const previous = ranked.get(command);
-        if (previous) {
-          previous.score += boost;
-          previous.source = "transition";
-        } else {
-          add(command, boost, "transition");
-        }
+        addTransition(command, 72 + Math.min(48, rawBoost));
       }
     }
-
-    for (const command of request.projectCandidates ?? []) add(command, 42, "project");
-    for (const command of request.generalCandidates ?? []) add(command, 8, "general");
-
-    return [...ranked.values()]
+    const transitions = [...transitionMap.values()]
       .sort((a, b) => b.score - a.score || a.command.length - b.command.length || a.command.localeCompare(b.command))
-      .slice(0, request.limit ?? 8);
+      .slice(0, 2);
+
+    const contextMap = new Map<string, RankedCommand>();
+    const addContext = (raw: string, score: number, source: "project" | "general"): void => {
+      const command = cleanCommand(raw);
+      if (command === null || command === prefix || !command.startsWith(prefix)) return;
+      const previous = contextMap.get(command);
+      if (!previous || score > previous.score) contextMap.set(command, { command, score, source });
+    };
+    for (const command of request.projectCandidates ?? []) addContext(command, 60, "project");
+    for (const command of request.generalCandidates ?? []) addContext(command, 12, "general");
+    const contextCandidates = [...contextMap.values()]
+      .sort((a, b) => b.score - a.score || a.command.length - b.command.length || a.command.localeCompare(b.command))
+      .slice(0, 5);
+
+    const combined = new Map<string, RankedCommand>();
+    for (const candidate of [
+      ...folderHistory,
+      ...transitions,
+      ...projectHistory,
+      ...contextCandidates,
+      ...globalHistory,
+    ]) {
+      const previous = combined.get(candidate.command);
+      if (!previous || candidate.score > previous.score) combined.set(candidate.command, candidate);
+    }
+    const ranked = [...combined.values()]
+      .sort((a, b) => b.score - a.score || a.command.length - b.command.length || a.command.localeCompare(b.command))
+      .slice(0, request.limit ?? 10);
+
+    return { folderHistory, projectHistory, globalHistory, transitions, contextCandidates, ranked };
   }
 
   attachLifecycle(): () => void {

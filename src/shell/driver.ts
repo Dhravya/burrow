@@ -364,6 +364,7 @@ export class ShellDriver {
     this.insert(data);
     if (previous !== null && previous.command.startsWith(this.line) && previous.command !== this.line) {
       this.renderSuggestion(previous.command, previous.origin);
+      this.scheduleSuggestion();
     } else {
       this.scheduleSuggestion();
     }

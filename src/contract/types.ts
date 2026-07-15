@@ -449,6 +449,7 @@ export interface AiGenerationHandle {
 
 export interface AiPanelAPI {
   getState(): AiState;
+  loadedModel(): AiModelId | null;
   /** navigator.gpu presence + adapter check. */
   webgpuSupported(): Promise<boolean>;
   /** Idempotent per model. Default model: AI_MODEL_DEFAULT. */
